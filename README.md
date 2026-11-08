@@ -1,128 +1,111 @@
-# mail-to-calendar-skill
+# mail-skill
 
-> 读邮箱（IMAP，只读）里带时间信息的邮件，抽成日程写进 Mac 日历的 agent skill：面试通知、笔试、报名截止、会议、航班、账单到期。
+> 用 IMAP 只读访问邮箱的 agent skill：按时间/发件人/关键词/附件检索、读正文、导出、下载附件，也能把邮件里的截止日期整理进 Mac 日历。
 
 ## 这是什么
 
-[apple-calendar-skill](https://github.com/DAweiD1/apple-calendar-skill) 的配套 skill。分工是：
+一个命令行工具加一份给 agent 看的说明书。你不是让 AI「猜」邮箱里有什么，而是让它**查**：
 
-- **这个 skill**：从邮箱里把「什么时候要做什么」捞出来，判断哪些还没过期。
-- **apple-calendar-skill**：把确定的事件写进日历，写完读回校验。
+```bash
+$ mail search --since 7d --unread        # 最近一周的未读
+$ mail read --uid 351 --chars 400        # 读其中一封，正文截断
+$ mail attach --uid 340 --out ./att      # 把这封的附件扒下来
+```
 
-两个加起来，一句「看看我邮箱里最近有什么要办的」就能落到手机日历上。
+`mail-to-calendar` 只是它的一条配方：把邮件里的面试、笔试、报名截止抽出来，交给 [apple-calendar-skill](https://github.com/DAweiD1/apple-calendar-skill) 写进日历。工具本身不关心日历。
 
 ## 设计取向
 
-**只读，而且刻意只读。** 脚本用 `SELECT readonly=True` + `BODY.PEEK[]`，连「标记已读」都不会发生。你邮箱里发生什么事，都该由你自己决定，agent 只负责看。
+**只读，而且刻意只读。** `SELECT readonly=True` + `BODY.PEEK[]`，连「标记已读」都不会发生。发信、删信、改标签这些能力，这里一个都没有。
 
-**默认不全量输出。** 拉 7 天邮件可能上百封，全塞进上下文既慢又贵。脚本只把命中时间类关键词（面试、截止、航班、会议……）或带 `.ics` 附件的邮件交出来，其余只计数。
+**列表便宜，正文按需。** 邮件正文动辄几千字，全塞进模型上下文既慢又贵，还会把真正重要的信息淹掉。所以 `search` 只回一行一封的摘要，`read` 才取正文，`save` 用来落盘给之后看。
 
-**凭据只在一个文件里，只被脚本读。** 不进 git、不进对话、不写进日历。备注里也不会出现考试口令、准考证号这类东西——那些跟着 iCloud 同步到所有设备不合适。
+**凭据只在一个文件里。** 脚本读它，输出里永远没有它。不进 git、不进对话、不进日历备注。
 
 ## 环境要求
 
-- Python 3.6+（macOS 自带的就够）
+- Python 3.6+（macOS 自带的够用）
 - 写日历那一步需要 macOS + [apple-calendar-skill](https://github.com/DAweiD1/apple-calendar-skill)
 
 ## 安装
 
 ```bash
-# 1) 先装日历那半边
-git clone https://github.com/DAweiD1/apple-calendar-skill.git
-cd apple-calendar-skill && bash scripts/build.sh && bash scripts/install.sh
-
-# 2) 再装这个
-git clone https://github.com/DAweiD1/mail-to-calendar-skill.git
-cd mail-to-calendar-skill && bash scripts/install.sh
+git clone https://github.com/DAweiD1/mail-skill.git
+cd mail-skill && bash scripts/install.sh
 ```
 
-## 配置（三步）
+装到 `~/.agents/skills/mail`，并生成配置模板。
+
+## 配置
 
 ```bash
-# 1) 建配置目录
-mkdir -p ~/.config/mail-to-calendar && chmod 700 ~/.config/mail-to-calendar
-
-# 2) 复制模板（装了 skill 的话模板已经在）
-cp config.example.txt ~/.config/mail-to-calendar/account.txt
-
-# 3) 编辑，填 user 和 password
-nano ~/.config/mail-to-calendar/account.txt
-chmod 600 ~/.config/mail-to-calendar/account.txt
+mkdir -p ~/.config/mail && chmod 700 ~/.config/mail
+cp config.example.txt ~/.config/mail/account.txt
+nano ~/.config/mail/account.txt     # 填 user 和 password
+chmod 600 ~/.config/mail/account.txt
 ```
-
-文件长这样：
 
 ```
 user = your-address@163.com
-password = 你的授权码
+password = 授权码
 ```
 
-`password` 填的是**授权码**，不是登录密码：
+`password` 是**授权码**不是登录密码：
 
-| 邮箱 | 哪里拿授权码 |
+| 邮箱 | 哪里拿 |
 |---|---|
 | 163 / 126 / 188 | 网页版 → 设置 → POP3/SMTP/IMAP → 开启 IMAP → 生成授权码 |
 | QQ / 腾讯企业邮 | 设置 → 账户 → POP3/IMAP 服务 → 开启并生成 |
 | Gmail | 先开两步验证，再生成「应用专用密码」 |
-| Outlook | 用应用密码，`host = outlook.office365.com` |
-| 公司企业邮 | `host` 改成 IT 给的 IMAP 地址，例如 `imap.qiye.163.com` |
-
-`host` / `port` / `folder` 一般不用填，脚本会按邮箱域名自动选服务器。
+| Outlook | 应用密码，`host = outlook.office365.com` |
+| 公司企业邮 | `host` 改成 IT 给的地址，例如 `imap.qiye.163.com` |
 
 验证：
 
 ```bash
-~/.agents/skills/mail-to-calendar/bin/mail check
+~/.agents/skills/mail/bin/mail check
 ```
 
-看到「连接成功」和邮件数就通了。
+## 命令
 
-## 用法
+| 命令 | 作用 |
+|---|---|
+| `check` | 连通性、邮件数、文件夹 |
+| `folders` | 文件夹列表（中文已解码） |
+| `search` | 邮件列表，不含正文 |
+| `read` | 读正文 |
+| `save` | 存 `.md` 或 `.eml` |
+| `attach` | 下载附件 |
 
-```bash
-MAIL=~/.agents/skills/mail-to-calendar/bin/mail
+`search` 参数：`--since`（`7d` / `2026-11-01` / `today`）、`--before`、`--sender`、`--subject`、`--query`、`--unread`、`--attachment`、`--match-any`、`--scan`、`--limit`、`--folder`、`--json`。
 
-$MAIL check                          # 账号连通性
-$MAIL fetch --days 7                 # 人看的摘要
-$MAIL fetch --days 7 --json          # 给 agent / 其他程序用
-$MAIL fetch --days 30 --limit 40     # 放宽窗口、控制规模
-$MAIL fetch --no-filter              # 不做关键词过滤，全给
-```
+`--json` 在每条命令上都可用，方便接其他程序。
 
-`fetch --json` 的结构：
+## 那些坑，已经填了
 
-```json
-{
-  "ok": true,
-  "account": "xxx@163.com",
-  "days": 7,
-  "scanned": 22,
-  "matched": 18,
-  "messages": [
-    { "uid": "…", "date": "2026-11-06T19:17:58+08:00",
-      "from": "…", "subject": "…", "ics": [], "text": "…" }
-  ]
-}
-```
+写这个工具时踩到的，都留在代码里了：
+
+- **163 的 `ID` 命令**：登录后不发，后续命令一律 `Unsafe Login`。
+- **中文文件夹名**：IMAP 用 modified UTF-7，`收件箱` 在线上是 `&g0l6P3ux-`。收发两个方向都做了转换。
+- **GB18030 正文**：国内邮件大量用 GB2312/GBK，解码链是「声明编码 → UTF-8 → GB18030 → Big5」。
+- **中文搜索**：服务端 SEARCH 普遍不支持 UTF-8，中文关键词会退化成「拉到本地再匹配」，用 `--since` 收窄范围能快很多。
 
 ## 给 agent 用
 
-把仓库放进 `~/.agents/skills/mail-to-calendar/`，`SKILL.md` 会被自动发现。里面写死了工作流：先 `check`，再 `fetch`，判断哪些没过期，出确认表，交给 apple-calendar 写入。
+仓库放进 `~/.agents/skills/mail/` 即可，`SKILL.md` 会被自动发现。里面写了工作流、省 token 的做法，以及「邮件转日历」的完整配方。
 
 ## 隐私与安全
 
-说清楚代价，别装看不见：
-
-- **凭据**只存在 `~/.config/mail-to-calendar/account.txt`（`chmod 600`），脚本读它登录，任何输出里都不会出现。
-- **邮件正文会进入 agent 的上下文**。这是抽日程的必然代价——不读正文就不知道日期。介意的话，别把 agent 指向工作邮箱。
-- 脚本**不会**标记已读、删除、转发、发信。它只有 `SELECT`、`SEARCH`、`FETCH`。
+- **凭据**只在 `~/.config/mail/account.txt`（`chmod 600`），脚本读它登录，任何输出里都不出现。
+- **邮件正文会进入 agent 上下文**——这是让 AI 读邮件的必然代价。不想让 work 邮箱进模型，就别把它配进来。
+- 脚本只有 `SELECT` / `SEARCH` / `FETCH` 三种操作，没有写入路径。
 - 授权码随时可以在邮箱网页端重新生成，旧的立刻失效。
 
 ## 已知限制
 
-- `.ics` 附件目前只识别文件名、不解析内容（下一步的事）。
-- 关键词过滤是字面匹配，冷门措辞可能漏。
-- 不做增量（每次重扫窗口内全部邮件），邮件量特别大的账号要自己调 `--limit`。
+- 没有增量同步，每次都在时间窗内重扫。
+- 附件下载按 MIME part 走，少数嵌套 `message/rfc822` 的邮件可能漏。
+- 不支持 OAuth（Gmail/Outlook 需要用应用专用密码）。
 
 ## License
 

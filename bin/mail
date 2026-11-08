@@ -1,13 +1,20 @@
 #!/usr/bin/env python3
-"""mail-to-calendar 的邮箱读取工具。
+"""mail —— 通用邮箱只读工具（IMAP）。
 
-只读设计：SELECT readonly=True + BODY.PEEK[]，不会改变邮件已读状态，也不会删除任何东西。
-凭据只从配置文件读取，任何时候都不打印、不回显。
+设计原则：
+  * 只读。SELECT readonly=True + BODY.PEEK[]，不改已读状态、不删信、不发信。
+  * 凭据只从配置文件读，任何输出里都不出现。
+  * 列表便宜、正文按需取 —— 让调用方（agent 或人）自己控制读多少。
 
-用法：
-    mail check                     检查账号能否登录
-    mail fetch --days 7            拉最近 7 天里疑似含时间信息的邮件
-    mail fetch --days 7 --json     同上，输出 JSON 给 agent / 其他程序用
+命令：
+  mail check                       账号连通性
+  mail folders                     文件夹列表
+  mail search   [过滤条件]          邮件列表（不含正文）
+  mail read     --uid N[,N]        读正文
+  mail save     --uid N --out 路径  存成 .md 或 .eml
+  mail attach   --uid N --out 目录  下载附件
+
+所有命令都支持 --json。
 """
 
 import argparse
@@ -22,13 +29,13 @@ from datetime import datetime, timedelta
 from email.header import decode_header, make_header
 from email.utils import parsedate_to_datetime
 
-# 163 的 IMAP 在登录后必须发 ID 命令，否则会被判定为异常客户端直接断开
+# 163/126 的 IMAP 登录后不发 ID 会被当异常客户端断开
 imaplib.Commands["ID"] = ("NONAUTH", "AUTH", "SELECTED")
-ID_ARGS = '("name" "mail-to-calendar" "version" "1.0" "vendor" "local" "contact" "local")'
+ID_ARGS = '("name" "mail-cli" "version" "2.0" "vendor" "local" "contact" "local")'
 
-DEFAULT_CONFIG = "~/.config/mail-to-calendar/account.txt"
+DEFAULT_CONFIG = "~/.config/mail/account.txt"
+LEGACY_CONFIG = "~/.config/mail-to-calendar/account.txt"   # 旧路径，兼容早期安装
 
-# 常见邮箱的 IMAP 服务器。不在表里的域名按 imap.<域名> 猜，猜错就用配置里的 host 覆盖。
 HOST_PRESETS = {
     "163.com": "imap.163.com",
     "126.com": "imap.126.com",
@@ -36,7 +43,6 @@ HOST_PRESETS = {
     "188.com": "imap.188.com",
     "qq.com": "imap.qq.com",
     "foxmail.com": "imap.qq.com",
-    "exmail.qq.com": "imap.exmail.qq.com",
     "gmail.com": "imap.gmail.com",
     "googlemail.com": "imap.gmail.com",
     "outlook.com": "outlook.office365.com",
@@ -47,14 +53,8 @@ HOST_PRESETS = {
     "aliyun.com": "imap.aliyun.com",
 }
 
-# 命中这些词的邮件才会被当成「可能含日程」输出，避免把整箱邮件灌进上下文
-SCHEDULE_HINTS = (
-    "会议", "面试", "预约", "航班", "机票", "酒店", "预定", "预订", "时间", "安排",
-    "日程", "报名", "截止", "ddl", "提醒", "考试", "笔试", "测评", "上课", "讲座",
-    "签到", "入职", "体检", "续费", "到期", "缴费", "行程",
-    "meeting", "interview", "booking", "flight", "reservation", "deadline",
-    "schedule", "appointment", "invitation", "exam", "due", "reminder",
-)
+MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun",
+          "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
 
 
 def die(msg, hint=None, code=1):
@@ -68,11 +68,13 @@ def die(msg, hint=None, code=1):
 
 def load_config(path):
     p = os.path.expanduser(path)
+    if not os.path.exists(p) and os.path.expanduser(LEGACY_CONFIG) != p:
+        legacy = os.path.expanduser(LEGACY_CONFIG)
+        if os.path.exists(legacy):
+            p = legacy
     if not os.path.exists(p):
-        die(
-            "找不到配置文件：%s" % p,
-            "复制仓库里的 config.example.txt 到该路径，填好 user 和 password 再试",
-        )
+        die("找不到配置文件：%s" % p,
+            "复制仓库里的 config.example.txt 到该路径，填 user 和 password")
     with open(p, encoding="utf-8", errors="replace") as f:
         lines = f.read().splitlines()
 
@@ -85,17 +87,15 @@ def load_config(path):
             key, value = line.split("=", 1)
             cfg[key.strip().lower()] = value.strip()
 
-    # 兼容「第一行账号、第二行授权码」的极简写法
-    if "user" not in cfg:
+    if "user" not in cfg:  # 兼容「第一行账号、第二行授权码」
         bare = [ln.strip() for ln in lines if ln.strip() and not ln.strip().startswith("#")]
         if len(bare) >= 2:
-            cfg["user"] = bare[0]
-            cfg["password"] = bare[-1]
+            cfg["user"], cfg["password"] = bare[0], bare[-1]
 
     if not cfg.get("user"):
-        die("配置里缺少 user（邮箱地址）")
+        die("配置里缺少 user")
     if not cfg.get("password"):
-        die("配置里缺少 password（163 等邮箱要用网页端生成的授权码，不是登录密码）")
+        die("配置里缺少 password（163 等邮箱要填网页端生成的授权码，不是登录密码）")
 
     cfg["folder"] = cfg.get("folder") or "INBOX"
     cfg["port"] = int(cfg.get("port") or 993)
@@ -105,39 +105,28 @@ def load_config(path):
     return cfg
 
 
-# ---------------------------------------------------------------- 连接
-
 def connect(cfg):
-    host, port = cfg["host"], cfg["port"]
     try:
-        conn = imaplib.IMAP4_SSL(host, port, timeout=20)
+        conn = imaplib.IMAP4_SSL(cfg["host"], cfg["port"], timeout=20)
     except Exception as exc:
-        die(
-            "连不上 %s:%d（%s）" % (host, port, exc),
-            "检查 host/port 是否写对；公司或学校网络可能封了 993 端口",
-        )
-
+        die("连不上 %s:%d（%s）" % (cfg["host"], cfg["port"], exc),
+            "检查 host/port；公司或学校网络可能封了 993 端口")
     try:
         conn.login(cfg["user"], cfg["password"])
     except imaplib.IMAP4.error as exc:
-        die(
-            "登录失败：%s" % str(exc).splitlines()[0],
-            "两种可能：1) 密码/授权码不对；2) 邮箱网页端没开启 IMAP 服务。\n"
-            "163/126/188：设置 → POP3/SMTP/IMAP → 开启 IMAP 并生成授权码\n"
+        die("登录失败：%s" % str(exc).splitlines()[0],
+            "1) 密码/授权码不对；2) 网页端没开 IMAP。\n"
+            "163/126/188：设置 → POP3/SMTP/IMAP → 开启并生成授权码\n"
             "QQ：设置 → 账户 → POP3/IMAP 服务 → 开启并生成授权码\n"
-            "Gmail：需要「应用专用密码」，普通密码登不上",
-        )
-
-    # 163/126 不发 ID 会被当作异常客户端，后续命令直接报 Unsafe Login
+            "Gmail：要「应用专用密码」")
     try:
         conn._simple_command("ID", ID_ARGS)
     except Exception:
         pass
-
     return conn
 
 
-# ---------------------------------------------------------------- 解析
+# ---------------------------------------------------------------- 编码
 
 def decode_mime(value):
     if not value:
@@ -149,7 +138,7 @@ def decode_mime(value):
 
 
 def decode_folder(name):
-    """IMAP 文件夹名用 modified UTF-7 编码，中文会变成 &XfJT0ZAB- 这种，解回来才看得懂。"""
+    """IMAP 文件夹名是 modified UTF-7，中文显示成 &XfJT0ZAB- 这种。"""
 
     def repl(match):
         chunk = match.group(1)
@@ -165,12 +154,31 @@ def decode_folder(name):
     return re.sub(r"&([^-]*)-", repl, name)
 
 
+def encode_folder(name):
+    """反方向：把中文文件夹名编成 IMAP 线上的写法。"""
+    out, buf = [], []
+
+    def flush():
+        if buf:
+            raw = "".join(buf).encode("utf-16-be")
+            b64 = base64.b64encode(raw).decode().rstrip("=").replace("/", ",")
+            out.append("&" + b64 + "-")
+            del buf[:]
+
+    for ch in name:
+        if 0x20 <= ord(ch) <= 0x7E:
+            flush()
+            out.append("&" if ch == "&" else ch)
+        else:
+            buf.append(ch)
+    flush()
+    return "".join(out)
+
+
 def decode_payload(part):
     payload = part.get_payload(decode=True) or b""
     charset = (part.get_content_charset() or "").lower()
-    candidates = [charset] if charset else []
-    candidates += ["utf-8", "gb18030", "big5", "latin-1"]
-    for enc in candidates:
+    for enc in [charset, "utf-8", "gb18030", "big5", "latin-1"]:
         if not enc:
             continue
         try:
@@ -178,6 +186,73 @@ def decode_payload(part):
         except (LookupError, UnicodeDecodeError):
             continue
     return payload.decode("utf-8", errors="replace")
+
+
+# ---------------------------------------------------------------- IMAP 时间
+
+def imap_date(text):
+    """接受 2026-11-01 / -7d / today，输出 IMAP 的 DD-Mon-YYYY。"""
+    text = (text or "").strip()
+    if not text:
+        return None
+    if text == "today":
+        day = datetime.now()
+    elif re.fullmatch(r"-?\d+d", text):
+        day = datetime.now() - timedelta(days=int(text.strip("-")[:-1]))
+    else:
+        try:
+            day = datetime.strptime(text, "%Y-%m-%d")
+        except ValueError:
+            die("日期格式看不懂：%s（要 2026-11-01 / 7d / today）" % text)
+    return "%02d-%s-%04d" % (day.day, MONTHS[day.month - 1], day.year)
+
+
+def human_date(text):
+    if not text:
+        return ""
+    try:
+        dt = parsedate_to_datetime(text)
+        return dt.strftime("%Y-%m-%d %H:%M")
+    except Exception:
+        return text
+
+
+# ---------------------------------------------------------------- 取信
+
+def fetch_message(conn, uid):
+    """返回 (raw bytes, flags 字符串)。"""
+    status, data = conn.fetch(uid, "(FLAGS BODY.PEEK[])")
+    if status != "OK" or not data:
+        return None
+    meta, raw = None, None
+    for item in data:
+        if isinstance(item, tuple):
+            meta = item[0].decode("utf-8", errors="replace")
+            raw = item[1]
+    if raw is None:
+        return None
+    flags = re.search(r"FLAGS \(([^)]*)\)", meta or "")
+    return raw, (flags.group(1) if flags else "")
+
+
+def describe(msg, uid, flags, chars):
+    text = body_text(msg, chars)
+    attachments = []
+    for part in msg.walk():
+        name = part.get_filename()
+        if name:
+            attachments.append({"name": decode_mime(name),
+                                "type": part.get_content_type()})
+    return {
+        "uid": uid,
+        "date": human_date(msg.get("Date")),
+        "from": decode_mime(msg.get("From")),
+        "to": decode_mime(msg.get("To")),
+        "subject": decode_mime(msg.get("Subject")),
+        "unread": "\\Seen" not in flags,
+        "attachments": attachments,
+        "text": text,
+    }
 
 
 def body_text(msg, limit):
@@ -198,29 +273,11 @@ def body_text(msg, limit):
     if target is html:
         text = re.sub(r"<(script|style).*?</\1>", " ", text, flags=re.S | re.I)
         text = re.sub(r"<[^>]+>", " ", text)
-        text = text.replace("&nbsp;", " ").replace("&ldquo;", "「").replace("&rdquo;", "」")
+        text = (text.replace("&nbsp;", " ").replace("&ldquo;", "「")
+                    .replace("&rdquo;", "」").replace("&amp;", "&"))
     text = re.sub(r"[ \t\r\f\v]+", " ", text)
     text = re.sub(r"\n\s*\n+", "\n", text)
-    return text.strip()[:limit]
-
-
-def ics_attachments(msg):
-    names = []
-    for part in msg.walk():
-        if part.get_content_type() == "text/calendar":
-            names.append(decode_mime(part.get_filename()) or "calendar.ics")
-        elif (part.get_filename() or "").lower().endswith(".ics"):
-            names.append(decode_mime(part.get_filename()))
-    return names
-
-
-def iso_date(header_value, fallback):
-    if header_value:
-        try:
-            return parsedate_to_datetime(header_value).isoformat()
-        except Exception:
-            pass
-    return fallback
+    return text.strip()[:limit] if limit else text.strip()
 
 
 # ---------------------------------------------------------------- 命令
@@ -229,134 +286,299 @@ def cmd_check(cfg, args):
     conn = connect(cfg)
     status, data = conn.select(cfg["folder"], readonly=True)
     if status != "OK":
-        die("打不开邮箱文件夹 %s：%s" % (cfg["folder"], data))
-
+        die("打不开文件夹 %s" % cfg["folder"])
     total = data[0].decode() if data and data[0] else "?"
-    status, folders = conn.list()
-    folder_names = []
-    if status == "OK":
-        for raw in folders:
-            text = raw.decode("utf-8", errors="replace") if isinstance(raw, bytes) else str(raw)
-            match = re.search(r'"([^"]*)"\s*$', text) or re.search(r"(\S+)\s*$", text)
-            if match:
-                folder_names.append(decode_folder(match.group(1)))
 
-    since = (datetime.now() - timedelta(days=7)).strftime("%d-%b-%Y")
+    status, raw_folders = conn.list()
+    folders = []
+    if status == "OK":
+        for raw in raw_folders:
+            line = raw.decode("utf-8", errors="replace") if isinstance(raw, bytes) else str(raw)
+            match = re.search(r'"([^"]*)"\s*$', line) or re.search(r"(\S+)\s*$", line)
+            if match:
+                folders.append(match.group(1))
+
+    since = imap_date("-7d")
     status, recent = conn.search(None, "(SINCE %s)" % since)
     recent_count = len(recent[0].split()) if status == "OK" and recent and recent[0] else 0
-
     conn.logout()
 
     result = {
-        "ok": True,
-        "host": cfg["host"],
-        "port": cfg["port"],
-        "user": cfg["user"],
-        "folder": cfg["folder"],
-        "messages_in_folder": total,
+        "ok": True, "host": cfg["host"], "port": cfg["port"], "user": cfg["user"],
+        "default_folder": cfg["folder"], "messages_in_folder": total,
         "messages_last_7_days": recent_count,
-        "folders": folder_names,
+        "folders": [decode_folder(f) for f in folders],
     }
     if args.json:
         print(json.dumps(result, ensure_ascii=False, indent=2))
     else:
         print("连接成功：%s → %s:%d" % (cfg["user"], cfg["host"], cfg["port"]))
-        print("文件夹 %s：共 %s 封，最近 7 天 %d 封" % (cfg["folder"], total, recent_count))
-        print("其他文件夹：%s" % (", ".join(folder_names) if folder_names else "（无）"))
+        print("%s：共 %s 封，最近 7 天 %d 封" % (cfg["folder"], total, recent_count))
+        print("文件夹：%s" % ", ".join(result["folders"]))
 
 
-def cmd_fetch(cfg, args):
+def cmd_folders(cfg, args):
     conn = connect(cfg)
-    status, _ = conn.select(cfg["folder"], readonly=True)
+    status, raw_folders = conn.list()
     if status != "OK":
-        die("打不开邮箱文件夹 %s" % cfg["folder"])
+        die("列文件夹失败")
+    items = []
+    for raw in raw_folders:
+        line = raw.decode("utf-8", errors="replace") if isinstance(raw, bytes) else str(raw)
+        match = re.search(r'"([^"]*)"\s*$', line) or re.search(r"(\S+)\s*$", line)
+        if not match:
+            continue
+        wire = match.group(1)
+        items.append({"name": decode_folder(wire), "wire": wire})
+    conn.logout()
 
-    since = (datetime.now() - timedelta(days=args.days)).strftime("%d-%b-%Y")
-    status, data = conn.search(None, "(SINCE %s)" % since)
+    if args.json:
+        print(json.dumps({"ok": True, "folders": items}, ensure_ascii=False, indent=2))
+    else:
+        for item in items:
+            print("%-16s %s" % (item["name"], item["wire"]))
+
+
+def build_criteria(args):
+    criteria = []
+    if args.unread:
+        criteria.append("UNSEEN")
+    if args.since:
+        criteria.append("SINCE %s" % imap_date(args.since))
+    if args.before:
+        criteria.append("BEFORE %s" % imap_date(args.before))
+    if args.sender:
+        criteria.append('FROM "%s"' % args.sender)
+    if args.subject and args.subject.isascii():
+        criteria.append('SUBJECT "%s"' % args.subject)
+    if args.query and args.query.isascii():
+        criteria.append('TEXT "%s"' % args.query)
+    return criteria
+
+
+def select_folder(conn, name):
+    for candidate in (name, encode_folder(name)):
+        try:
+            status, data = conn.select(candidate, readonly=True)
+            if status == "OK":
+                return data
+        except Exception:
+            continue
+    die("打不开文件夹：%s（用 mail folders 看可选值）" % name)
+
+
+def cmd_search(cfg, args):
+    conn = connect(cfg)
+    select_folder(conn, args.folder or cfg["folder"])
+
+    criteria = build_criteria(args) or ["ALL"]
+    status, data = conn.search(None, "(%s)" % " ".join(criteria) if len(criteria) > 1 else criteria[0])
     if status != "OK":
         die("搜索失败：%s" % data)
 
-    all_uids = data[0].split() if data and data[0] else []
-    uids = all_uids[-args.limit:]
-    messages = []
+    uids = data[0].split() if data and data[0] else []
+    uids = uids[-args.scan:]
 
+    # 需要本地过滤的情形：非 ASCII 关键词、附件、正文匹配
+    needle = None
+    if args.query and not args.query.isascii():
+        needle = args.query.lower()
+    if args.subject and not args.subject.isascii():
+        needle = args.subject.lower()
+    local_filter = bool(needle or args.attachment or args.match_any)
+
+    results = []
     for uid in reversed(uids):
-        status, fetched = conn.fetch(uid, "(BODY.PEEK[])")
-        if status != "OK" or not fetched or not isinstance(fetched[0], tuple):
-            continue
-        msg = email.message_from_bytes(fetched[0][1])
-        subject = decode_mime(msg.get("Subject"))
-        sender = decode_mime(msg.get("From"))
-        text = body_text(msg, args.chars)
-        ics = ics_attachments(msg)
-
-        if args.no_filter:
-            relevant = True
+        if len(results) >= args.limit:
+            break
+        uid_str = uid.decode() if isinstance(uid, bytes) else str(uid)
+        if local_filter:
+            fetched = fetch_message(conn, uid)
+            if not fetched:
+                continue
+            raw, flags = fetched
+            msg = email.message_from_bytes(raw)
+            info = describe(msg, uid_str, flags, 0 if args.match_any else 2000)
+            if needle:
+                haystack = (info["subject"] + " " + info["text"]).lower()
+                if needle not in haystack:
+                    continue
+            if args.attachment and not info["attachments"]:
+                continue
+            if args.match_any:
+                haystack = (info["subject"] + " " + info["text"]).lower()
+                words = [w.strip().lower() for w in args.match_any.split(",") if w.strip()]
+                if not any(w in haystack for w in words):
+                    continue
+            results.append(info)
         else:
-            haystack = (subject + "\n" + text).lower()
-            relevant = bool(ics) or any(h.lower() in haystack for h in SCHEDULE_HINTS)
-        if not relevant:
-            continue
-
-        messages.append(
-            {
-                "uid": uid.decode() if isinstance(uid, bytes) else str(uid),
-                "date": iso_date(msg.get("Date"), iso_date(msg.get("Received"), "")),
-                "from": sender,
-                "subject": subject,
-                "ics": ics,
-                "text": text,
-            }
-        )
+            fetched = fetch_message(conn, uid)
+            if not fetched:
+                continue
+            raw, flags = fetched
+            msg = email.message_from_bytes(raw)
+            results.append(describe(msg, uid_str, flags, 0))
 
     conn.logout()
 
-    payload = {
-        "ok": True,
-        "account": cfg["user"],
-        "host": cfg["host"],
-        "folder": cfg["folder"],
-        "days": args.days,
-        "scanned": len(uids),
-        "matched": len(messages),
-        "messages": messages,
-    }
+    slim = [{k: v for k, v in item.items() if k != "text"} for item in results]
+    if args.json:
+        print(json.dumps({"ok": True, "count": len(slim), "messages": slim},
+                         ensure_ascii=False, indent=2))
+    else:
+        print("%d 封" % len(slim))
+        for item in slim:
+            mark = "●" if item["unread"] else " "
+            clip = ", ".join(a["name"] for a in item["attachments"])
+            print("%s %-8s %-16s %-26s %s%s" % (
+                mark, item["uid"], item["date"][5:16],
+                item["from"][:26], item["subject"][:44],
+                ("  [" + clip + "]") if clip else ""))
+
+
+def cmd_read(cfg, args):
+    conn = connect(cfg)
+    select_folder(conn, args.folder or cfg["folder"])
+    out = []
+    for uid in args.uid.split(","):
+        uid = uid.strip()
+        if not uid:
+            continue
+        fetched = fetch_message(conn, uid)
+        if not fetched:
+            out.append({"uid": uid, "error": "读不到这封"})
+            continue
+        raw, flags = fetched
+        msg = email.message_from_bytes(raw)
+        out.append(describe(msg, uid, flags, args.chars))
+    conn.logout()
 
     if args.json:
-        print(json.dumps(payload, ensure_ascii=False, indent=2))
+        print(json.dumps({"ok": True, "messages": out}, ensure_ascii=False, indent=2))
         return
-
-    print("# %s｜%s｜最近 %d 天，扫 %d 封，命中 %d 封"
-          % (cfg["user"], cfg["host"], args.days, len(uids), len(messages)))
-    print()
-    for index, item in enumerate(messages, 1):
-        print("## [%d] %s" % (index, item["date"]))
+    for item in out:
+        if item.get("error"):
+            print("[%s] %s" % (item["uid"], item["error"]))
+            continue
+        print("=" * 60)
+        print("UID   ：%s" % item["uid"])
+        print("日期  ：%s" % item["date"])
         print("发件人：%s" % item["from"])
-        print("主题：%s" % item["subject"])
-        if item["ics"]:
-            print("附件(ics)：%s" % ", ".join(item["ics"]))
-        print("正文：")
+        print("收件人：%s" % item["to"])
+        print("主题  ：%s" % item["subject"])
+        if item["attachments"]:
+            print("附件  ：%s" % ", ".join(a["name"] for a in item["attachments"]))
+        print("-" * 60)
         print(item["text"] or "（无纯文本正文）")
-        print()
+
+
+def cmd_save(cfg, args):
+    conn = connect(cfg)
+    select_folder(conn, args.folder or cfg["folder"])
+    fetched = fetch_message(conn, args.uid)
+    if not fetched:
+        die("读不到 uid=%s" % args.uid)
+    raw, flags = fetched
+    msg = email.message_from_bytes(raw)
+    info = describe(msg, args.uid, flags, 0)
+
+    out = os.path.expanduser(args.out)
+    os.makedirs(os.path.dirname(os.path.abspath(out)) or ".", exist_ok=True)
+    if out.endswith(".eml"):
+        with open(out, "wb") as f:
+            f.write(raw)
+    else:
+        with open(out, "w", encoding="utf-8") as f:
+            f.write("# %s\n\n" % info["subject"])
+            f.write("- 日期：%s\n- 发件人：%s\n- 收件人：%s\n" %
+                    (info["date"], info["from"], info["to"]))
+            if info["attachments"]:
+                f.write("- 附件：%s\n" % ", ".join(a["name"] for a in info["attachments"]))
+            f.write("\n---\n\n%s\n" % info["text"])
+    conn.logout()
+    print(json.dumps({"ok": True, "path": out, "bytes": os.path.getsize(out)},
+                     ensure_ascii=False))
+
+
+def cmd_attach(cfg, args):
+    conn = connect(cfg)
+    select_folder(conn, args.folder or cfg["folder"])
+    fetched = fetch_message(conn, args.uid)
+    if not fetched:
+        die("读不到 uid=%s" % args.uid)
+    raw, _ = fetched
+    msg = email.message_from_bytes(raw)
+
+    outdir = os.path.expanduser(args.out)
+    os.makedirs(outdir, exist_ok=True)
+    saved = []
+    for part in msg.walk():
+        name = part.get_filename()
+        if not name:
+            continue
+        safe = re.sub(r"[^\w.\-]", "_", decode_mime(name)) or "attachment"
+        path = os.path.join(outdir, "%s-%s" % (args.uid, safe))
+        with open(path, "wb") as f:
+            f.write(part.get_payload(decode=True) or b"")
+        saved.append({"name": decode_mime(name), "path": path,
+                      "type": part.get_content_type(),
+                      "bytes": os.path.getsize(path)})
+    conn.logout()
+
+    if args.json:
+        print(json.dumps({"ok": True, "saved": saved}, ensure_ascii=False, indent=2))
+    else:
+        if not saved:
+            print("这封没有附件")
+        for item in saved:
+            print("%s (%d bytes) → %s" % (item["name"], item["bytes"], item["path"]))
 
 
 def main():
-    parser = argparse.ArgumentParser(
-        prog="mail",
-        description="只读读取邮箱，供 agent 抽取日程后写进日历",
-    )
+    parser = argparse.ArgumentParser(prog="mail", description="只读邮箱工具")
     parser.add_argument("--config", default=DEFAULT_CONFIG, help="配置文件路径")
     sub = parser.add_subparsers(dest="command")
 
-    check = sub.add_parser("check", help="检查账号能否登录")
+    def folder_arg(p):
+        p.add_argument("--folder", help="邮箱文件夹，默认值见 config")
+
+    check = sub.add_parser("check", help="账号连通性")
     check.add_argument("--json", action="store_true")
 
-    fetch = sub.add_parser("fetch", help="拉取疑似含时间信息的邮件")
-    fetch.add_argument("--days", type=int, default=7)
-    fetch.add_argument("--limit", type=int, default=60, help="最多检查多少封")
-    fetch.add_argument("--chars", type=int, default=700, help="每封正文最多保留多少字符")
-    fetch.add_argument("--json", action="store_true")
-    fetch.add_argument("--no-filter", action="store_true", help="不做关键词过滤，全部输出")
+    folders = sub.add_parser("folders", help="文件夹列表")
+    folders.add_argument("--json", action="store_true")
+
+    search = sub.add_parser("search", help="邮件列表（不含正文）")
+    folder_arg(search)
+    search.add_argument("--query", help="全文关键词（非 ASCII 会退化为本地过滤）")
+    search.add_argument("--sender", help="发件人包含")
+    search.add_argument("--subject", help="主题包含")
+    search.add_argument("--since", help="起始日期：2026-11-01 / 7d（七天前）/ today")
+    search.add_argument("--before", help="截止日期：2026-11-30")
+    search.add_argument("--unread", action="store_true", help="只看未读")
+    search.add_argument("--attachment", action="store_true", help="只看带附件的")
+    search.add_argument("--match-any", help="逗号分隔的关键词，命中任意一个（标题+正文）")
+    search.add_argument("--scan", type=int, default=200, help="最多检查多少封")
+    search.add_argument("--limit", type=int, default=30, help="最多返回多少封")
+    search.add_argument("--json", action="store_true")
+
+    read = sub.add_parser("read", help="读正文")
+    folder_arg(read)
+    read.add_argument("--uid", required=True, help="单个 uid，或逗号分隔多个")
+    read.add_argument("--chars", type=int, default=2000, help="每封正文最多多少字符，0 = 全文")
+    read.add_argument("--json", action="store_true")
+
+    save = sub.add_parser("save", help="存成 .md 或 .eml")
+    folder_arg(save)
+    save.add_argument("--uid", required=True)
+    save.add_argument("--out", required=True)
+    save.add_argument("--json", action="store_true")
+
+    attach = sub.add_parser("attach", help="下载附件")
+    folder_arg(attach)
+    attach.add_argument("--uid", required=True)
+    attach.add_argument("--out", default="./attachments")
+    attach.add_argument("--json", action="store_true")
 
     args = parser.parse_args()
     if not args.command:
@@ -364,10 +586,11 @@ def main():
         sys.exit(0)
 
     cfg = load_config(args.config)
-    if args.command == "check":
-        cmd_check(cfg, args)
-    else:
-        cmd_fetch(cfg, args)
+    handlers = {
+        "check": cmd_check, "folders": cmd_folders, "search": cmd_search,
+        "read": cmd_read, "save": cmd_save, "attach": cmd_attach,
+    }
+    handlers[args.command](cfg, args)
 
 
 if __name__ == "__main__":

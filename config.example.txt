@@ -1,10 +1,10 @@
-# mail-to-calendar 账号配置
+# mail-skill 账号配置
 #
 # 用法：
-#   1. 复制这个文件到 ~/.config/mail-to-calendar/account.txt
+#   1. 复制到 ~/.config/mail/account.txt
 #   2. 填下面的 user 和 password
-#   3. chmod 600 ~/.config/mail-to-calendar/account.txt
-#   4. 跑：~/.agents/skills/mail-to-calendar/bin/mail check
+#   3. chmod 600 ~/.config/mail/account.txt
+#   4. 跑：~/.agents/skills/mail/bin/mail check
 #
 # password 不是登录密码：
 #   163 / 126 / 188  网页版 → 设置 → POP3/SMTP/IMAP → 开启 IMAP → 生成「授权码」
