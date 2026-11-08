@@ -12,7 +12,7 @@ $ mail read --uid 351 --chars 400        # 读其中一封，正文截断
 $ mail attach --uid 340 --out ./att      # 把这封的附件扒下来
 ```
 
-`mail-to-calendar` 只是它的一条配方：把邮件里的面试、笔试、报名截止抽出来，交给 [apple-calendar-skill](https://github.com/DAweiD1/apple-calendar-skill) 写进日历。工具本身不关心日历。
+把邮件里的面试、笔试、报名截止写进日历，只是它的一条配方——交给 [apple-calendar-skill](https://github.com/DAweiD1/apple-calendar-skill) 完成。工具本身不关心日历。
 
 ## 设计取向
 
