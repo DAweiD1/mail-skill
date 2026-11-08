@@ -1,0 +1,24 @@
+# mail-to-calendar 账号配置
+#
+# 用法：
+#   1. 复制这个文件到 ~/.config/mail-to-calendar/account.txt
+#   2. 填下面的 user 和 password
+#   3. chmod 600 ~/.config/mail-to-calendar/account.txt
+#   4. 跑：~/.agents/skills/mail-to-calendar/bin/mail check
+#
+# password 不是登录密码：
+#   163 / 126 / 188  网页版 → 设置 → POP3/SMTP/IMAP → 开启 IMAP → 生成「授权码」
+#   QQ / 腾讯企业邮   设置 → 账户 → POP3/IMAP 服务 → 开启并生成「授权码」
+#   Gmail            先开两步验证，再生成「应用专用密码」
+#   Outlook          用应用密码，host 填 outlook.office365.com
+#   公司企业邮        host 改成 IT 给你的 IMAP 地址，例如 imap.qiye.163.com
+#
+# 只想填两行也行（脚本兼容）：第一行邮箱，第二行授权码。
+
+user = your-address@163.com
+password = 在这里填授权码
+
+# 下面几项通常不用填，脚本会按邮箱域名自动推断
+# host = imap.163.com
+# port = 993
+# folder = INBOX

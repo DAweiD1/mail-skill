@@ -1,0 +1,10 @@
+# 本地账号配置（含授权码）
+account.txt
+config.local.txt
+
+# Python
+__pycache__/
+*.pyc
+
+# macOS
+.DS_Store
